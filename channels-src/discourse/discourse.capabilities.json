@@ -1,0 +1,71 @@
+{
+  "type": "channel",
+  "name": "discourse",
+  "description": "Discourse forum channel for receiving and responding to forum posts",
+  "setup": {
+    "required_secrets": [
+      {
+        "name": "discourse_api_key",
+        "prompt": "Discourse API Key (Admin > API > New API Key)",
+        "validation": "^[a-f0-9]{64}$"
+      },
+      {
+        "name": "discourse_api_username",
+        "prompt": "Discourse bot username (e.g., ironclaw-bot)"
+      },
+      {
+        "name": "discourse_webhook_secret",
+        "prompt": "Webhook secret (leave empty to auto-generate)",
+        "optional": true,
+        "auto_generate": { "length": 32 }
+      }
+    ]
+  },
+  "capabilities": {
+    "http": {
+      "allowlist": [
+        { "host": "discuss.near.vote", "path_prefix": "/" }
+      ],
+      "credentials": {
+        "discourse_api_key": {
+          "secret_name": "discourse_api_key",
+          "location": { "type": "header", "name": "Api-Key" },
+          "host_patterns": ["discuss.near.vote"]
+        },
+        "discourse_api_username": {
+          "secret_name": "discourse_api_username",
+          "location": { "type": "header", "name": "Api-Username" },
+          "host_patterns": ["discuss.near.vote"]
+        }
+      },
+      "rate_limit": {
+        "requests_per_minute": 20,
+        "requests_per_hour": 500
+      }
+    },
+    "secrets": {
+      "allowed_names": ["discourse_*"]
+    },
+    "channel": {
+      "allowed_paths": ["/webhook/discourse"],
+      "allow_polling": true,
+      "workspace_prefix": "channels/discourse/",
+      "emit_rate_limit": {
+        "messages_per_minute": 30,
+        "messages_per_hour": 500
+      },
+      "webhook": {
+        "secret_header": "X-Webhook-Secret",
+        "secret_name": "discourse_webhook_secret"
+      }
+    }
+  },
+  "config": {
+    "base_url": "https://discuss.near.vote",
+    "bot_username": null,
+    "marker_token": "[ironclaw]",
+    "handle_edited_posts": false,
+    "allowed_categories": [],
+    "owner_username": null
+  }
+}
