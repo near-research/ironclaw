@@ -49,8 +49,60 @@ use crate::channels::wasm::schema::ChannelConfig;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
 use crate::error::ChannelError;
 use crate::safety::LeakDetector;
-use crate::tools::wasm::LogLevel;
+use crate::tools::wasm::{LogLevel, WorkspaceCapability, WorkspaceReader};
 use crate::tools::wasm::WasmResourceLimiter;
+
+/// In-memory workspace storage shared across callbacks for a single channel.
+///
+/// WASM instances are fresh per callback, so workspace writes must be persisted
+/// between callbacks. This provides a simple in-memory store that the
+/// `WorkspaceReader` reads from and pending writes are flushed to.
+type WorkspaceStore = Arc<std::sync::RwLock<HashMap<String, String>>>;
+
+/// WorkspaceReader backed by the in-memory store.
+struct InMemoryWorkspaceReader {
+    store: WorkspaceStore,
+}
+
+impl WorkspaceReader for InMemoryWorkspaceReader {
+    fn read(&self, path: &str) -> Option<String> {
+        self.store.read().ok()?.get(path).cloned()
+    }
+}
+
+/// Flush host state after a WASM callback: commit pending writes and emit logs.
+fn flush_host_state(
+    host_state: &mut ChannelHostState,
+    workspace_store: &WorkspaceStore,
+    channel_name: &str,
+) {
+    // Commit pending workspace writes
+    let writes = host_state.take_pending_writes();
+    if !writes.is_empty() {
+        if let Ok(mut store) = workspace_store.write() {
+            for write in &writes {
+                store.insert(write.path.clone(), write.content.clone());
+            }
+        }
+        tracing::debug!(
+            channel = %channel_name,
+            count = writes.len(),
+            "Flushed workspace writes"
+        );
+    }
+
+    // Emit WASM logs via host tracing
+    let logs = host_state.take_logs();
+    for entry in logs {
+        match entry.level {
+            LogLevel::Trace => tracing::trace!(channel = %channel_name, "[wasm] {}", entry.message),
+            LogLevel::Debug => tracing::debug!(channel = %channel_name, "[wasm] {}", entry.message),
+            LogLevel::Info => tracing::info!(channel = %channel_name, "[wasm] {}", entry.message),
+            LogLevel::Warn => tracing::warn!(channel = %channel_name, "[wasm] {}", entry.message),
+            LogLevel::Error => tracing::error!(channel = %channel_name, "[wasm] {}", entry.message),
+        }
+    }
+}
 
 // Generate component model bindings from the WIT file
 wasmtime::component::bindgen!({
@@ -251,6 +303,21 @@ impl near::agent::channel_host::Host for ChannelStoreData {
             .scan_http_request(&url, &header_vec, body.as_deref())
             .map_err(|e| format!("Potential secret leak blocked: {}", e))?;
 
+        // Collect credential values for redacting error messages (self can't cross await)
+        let redact_pairs: Vec<(String, String)> = self
+            .credentials
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let redact = move |s: String| -> String {
+            let mut out = s;
+            for (name, value) in &redact_pairs {
+                out = out.replace(value.as_str(), &format!("[REDACTED:{}]", name));
+            }
+            out
+        };
+
         // Make the HTTP request using blocking I/O
         // We're already in a spawn_blocking context, so we can use block_on
         let result = tokio::runtime::Handle::current().block_on(async {
@@ -281,7 +348,7 @@ impl near::agent::channel_host::Host for ChannelStoreData {
                 .timeout(std::time::Duration::from_secs(30))
                 .send()
                 .await
-                .map_err(|e| format!("HTTP request failed: {}", e))?;
+                .map_err(|e| redact(format!("HTTP request failed: {}", e)))?;
 
             let status = response.status().as_u16();
             let response_headers: std::collections::HashMap<String, String> = response
@@ -297,7 +364,7 @@ impl near::agent::channel_host::Host for ChannelStoreData {
             let body = response
                 .bytes()
                 .await
-                .map_err(|e| format!("Failed to read response body: {}", e))?
+                .map_err(|e| redact(format!("Failed to read response body: {}", e)))?
                 .to_vec();
 
             tracing::info!(
@@ -421,6 +488,10 @@ pub struct WasmChannel {
     /// Wrapped in Arc for sharing with the polling task.
     credentials: Arc<RwLock<HashMap<String, String>>>,
 
+    /// In-memory workspace storage shared across all callbacks.
+    /// Workspace writes are flushed here after each callback completes.
+    workspace_store: WorkspaceStore,
+
     /// Background task that repeats typing indicators every 4 seconds.
     /// Telegram's "typing..." indicator expires after ~5s, so we refresh it.
     typing_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
@@ -451,6 +522,7 @@ impl WasmChannel {
             poll_shutdown_tx: RwLock::new(None),
             endpoints: RwLock::new(Vec::new()),
             credentials: Arc::new(RwLock::new(HashMap::new())),
+            workspace_store: Arc::new(std::sync::RwLock::new(HashMap::new())),
             typing_task: RwLock::new(None),
         }
     }
@@ -533,15 +605,25 @@ impl WasmChannel {
         prepared: &PreparedChannelModule,
         capabilities: &ChannelCapabilities,
         credentials: HashMap<String, String>,
+        workspace_store: &WorkspaceStore,
     ) -> Result<Store<ChannelStoreData>, WasmChannelError> {
         let engine = runtime.engine();
         let limits = &prepared.limits;
+
+        // Inject workspace reader so WASM can read persisted state from prior callbacks
+        let mut caps = capabilities.clone();
+        caps.tool_capabilities.workspace_read = Some(WorkspaceCapability {
+            allowed_prefixes: vec![caps.workspace_prefix.clone()],
+            reader: Some(Arc::new(InMemoryWorkspaceReader {
+                store: Arc::clone(workspace_store),
+            })),
+        });
 
         // Create fresh store with channel state (NEAR pattern: fresh instance per call)
         let store_data = ChannelStoreData::new(
             limits.memory_bytes,
             &prepared.name,
-            capabilities.clone(),
+            caps,
             credentials,
         );
         let mut store = Store::new(engine, store_data);
@@ -640,15 +722,21 @@ impl WasmChannel {
         let prepared = Arc::clone(&self.prepared);
         let capabilities = self.capabilities.clone();
         let config_json = self.config_json.read().await.clone();
+        tracing::debug!(
+            channel = %self.name,
+            config = %config_json,
+            "Calling on_start with config"
+        );
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
+        let ws_store = Arc::clone(&self.workspace_store);
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
                 let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials, &ws_store)?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 // Call on_start using the generated typed interface
@@ -668,9 +756,10 @@ impl WasmChannel {
                     }
                 };
 
-                let host_state =
+                let mut host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
-                Ok((config, host_state))
+                flush_host_state(&mut host_state, &ws_store, &prepared.name);
+                Ok(config)
             })
             .await
             .map_err(|e| WasmChannelError::ExecutionPanicked {
@@ -681,11 +770,14 @@ impl WasmChannel {
         .await;
 
         match result {
-            Ok(Ok((config, _host_state))) => {
+            Ok(Ok(config)) => {
                 tracing::info!(
                     channel = %self.name,
                     display_name = %config.display_name,
                     endpoints = config.http_endpoints.len(),
+                    has_poll_config = config.poll.is_some(),
+                    poll_enabled = config.poll.as_ref().map(|p| p.enabled),
+                    poll_interval_ms = config.poll.as_ref().map(|p| p.interval_ms),
                     "WASM channel on_start completed"
                 );
                 Ok(config)
@@ -753,6 +845,7 @@ impl WasmChannel {
         let capabilities = self.capabilities.clone();
         let timeout = self.runtime.config().callback_timeout;
         let credentials = self.get_credentials().await;
+        let ws_store = Arc::clone(&self.workspace_store);
 
         // Prepare request data
         let method = method.to_string();
@@ -767,7 +860,7 @@ impl WasmChannel {
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
                 let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials, &ws_store)?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 // Build the WIT request type
@@ -787,8 +880,9 @@ impl WasmChannel {
                     .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
 
                 let response = convert_http_response(wit_response);
-                let host_state =
+                let mut host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                flush_host_state(&mut host_state, &ws_store, &prepared.name);
                 Ok((response, host_state))
             })
             .await
@@ -840,12 +934,13 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
+        let ws_store = Arc::clone(&self.workspace_store);
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
                 let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials, &ws_store)?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 // Call on_poll using the generated typed interface
@@ -854,8 +949,9 @@ impl WasmChannel {
                     .call_on_poll(&mut store)
                     .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
 
-                let host_state =
+                let mut host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                flush_host_state(&mut host_state, &ws_store, &prepared.name);
                 Ok(((), host_state))
             })
             .await
@@ -929,6 +1025,7 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
+        let ws_store = Arc::clone(&self.workspace_store);
 
         // Prepare response data
         let message_id_str = message_id.to_string();
@@ -943,7 +1040,7 @@ impl WasmChannel {
             tokio::task::spawn_blocking(move || {
                 tracing::info!("Creating WASM store for on_respond");
                 let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials, &ws_store)?;
 
                 tracing::info!("Instantiating WASM component for on_respond");
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
@@ -983,10 +1080,11 @@ impl WasmChannel {
                     });
                 }
 
-                let host_state =
+                let mut host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                flush_host_state(&mut host_state, &ws_store, &prepared.name);
                 tracing::info!("on_respond WASM execution completed successfully");
-                Ok(((), host_state))
+                Ok(())
             })
             .await
             .map_err(|e| {
@@ -1001,7 +1099,7 @@ impl WasmChannel {
 
         let channel_name = self.name.clone();
         match result {
-            Ok(Ok(((), _host_state))) => {
+            Ok(Ok(())) => {
                 tracing::debug!(
                     channel = %channel_name,
                     message_id = %message_id,
@@ -1036,13 +1134,14 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
+        let ws_store = Arc::clone(&self.workspace_store);
 
         let wit_update = status_to_wit(status, metadata);
 
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
                 let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials)?;
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials, &ws_store)?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 let channel_iface = instance.near_agent_channel();
@@ -1088,6 +1187,7 @@ impl WasmChannel {
         credentials: &RwLock<HashMap<String, String>>,
         timeout: Duration,
         wit_update: wit_channel::StatusUpdate,
+        workspace_store: &WorkspaceStore,
     ) -> Result<(), WasmChannelError> {
         if prepared.component_bytes.is_empty() {
             return Ok(());
@@ -1098,11 +1198,12 @@ impl WasmChannel {
         let capabilities = capabilities.clone();
         let credentials_snapshot = credentials.read().await.clone();
         let channel_name_owned = channel_name.to_string();
+        let ws_store = Arc::clone(workspace_store);
 
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
                 let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials_snapshot)?;
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials_snapshot, &ws_store)?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 let channel_iface = instance.near_agent_channel();
@@ -1172,6 +1273,7 @@ impl WasmChannel {
                 let credentials = self.credentials.clone();
                 let callback_timeout = self.runtime.config().callback_timeout;
                 let wit_update = status_to_wit(&status, metadata);
+                let ws_store = Arc::clone(&self.workspace_store);
 
                 let handle = tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(4));
@@ -1191,6 +1293,7 @@ impl WasmChannel {
                             &credentials,
                             callback_timeout,
                             wit_update_clone,
+                            &ws_store,
                         )
                         .await
                         {
@@ -1320,6 +1423,7 @@ impl WasmChannel {
         let rate_limiter = self.rate_limiter.clone();
         let credentials = self.credentials.clone();
         let callback_timeout = self.runtime.config().callback_timeout;
+        let ws_store = Arc::clone(&self.workspace_store);
 
         tokio::spawn(async move {
             let mut interval_timer = tokio::time::interval(interval);
@@ -1340,6 +1444,7 @@ impl WasmChannel {
                             &prepared,
                             &capabilities,
                             &credentials,
+                            &ws_store,
                             callback_timeout,
                         ).await;
 
@@ -1391,6 +1496,7 @@ impl WasmChannel {
         prepared: &Arc<PreparedChannelModule>,
         capabilities: &ChannelCapabilities,
         credentials: &RwLock<HashMap<String, String>>,
+        workspace_store: &WorkspaceStore,
         timeout: Duration,
     ) -> Result<Vec<EmittedMessage>, WasmChannelError> {
         // Skip if no WASM bytes (testing mode)
@@ -1407,12 +1513,13 @@ impl WasmChannel {
         let capabilities = capabilities.clone();
         let credentials_snapshot = credentials.read().await.clone();
         let channel_name_owned = channel_name.to_string();
+        let ws_store = Arc::clone(workspace_store);
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
                 let mut store =
-                    Self::create_store(&runtime, &prepared, &capabilities, credentials_snapshot)?;
+                    Self::create_store(&runtime, &prepared, &capabilities, credentials_snapshot, &ws_store)?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
                 // Call on_poll using the generated typed interface
@@ -1421,8 +1528,9 @@ impl WasmChannel {
                     .call_on_poll(&mut store)
                     .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
 
-                let host_state =
+                let mut host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+                flush_host_state(&mut host_state, &ws_store, &prepared.name);
                 Ok(host_state)
             })
             .await
@@ -1598,7 +1706,17 @@ impl Channel for WasmChannel {
                 *self.poll_shutdown_tx.write().await = Some(poll_shutdown_tx);
 
                 self.start_polling(Duration::from_millis(interval as u64), poll_shutdown_rx);
+            } else {
+                tracing::warn!(
+                    channel = %self.name,
+                    "Polling configured but disabled (enabled=false)"
+                );
             }
+        } else {
+            tracing::warn!(
+                channel = %self.name,
+                "No poll config returned by on_start — polling will not run"
+            );
         }
 
         tracing::info!(
@@ -1928,7 +2046,7 @@ mod tests {
     use crate::channels::wasm::runtime::{
         PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig,
     };
-    use crate::channels::wasm::wrapper::{HttpResponse, WasmChannel};
+    use crate::channels::wasm::wrapper::{HttpResponse, WasmChannel, WorkspaceStore};
     use crate::tools::wasm::ResourceLimits;
 
     fn create_test_channel() -> WasmChannel {
@@ -2013,12 +2131,14 @@ mod tests {
         let credentials = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let timeout = std::time::Duration::from_secs(5);
 
+        let workspace_store: WorkspaceStore = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let result = WasmChannel::execute_poll(
             "poll-test",
             &runtime,
             &prepared,
             &capabilities,
             &credentials,
+            &workspace_store,
             timeout,
         )
         .await;

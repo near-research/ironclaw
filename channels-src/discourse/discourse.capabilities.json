@@ -62,7 +62,7 @@
   },
   "config": {
     "base_url": "https://discuss.near.vote",
-    "bot_username": null,
+    "bot_username": "admin",
     "marker_token": "[ironclaw]",
     "handle_edited_posts": false,
     "allowed_categories": [],

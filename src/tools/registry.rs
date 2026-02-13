@@ -347,7 +347,7 @@ impl Default for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::tool::EchoTool;
+    use crate::tools::builtin::EchoTool;
 
     #[tokio::test]
     async fn test_register_and_get() {
