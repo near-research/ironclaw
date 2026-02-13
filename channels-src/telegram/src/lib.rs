@@ -72,6 +72,10 @@ struct TelegramMessage {
     /// Message text.
     text: Option<String>,
 
+    /// Caption for media (photo, video, document, etc.).
+    #[serde(default)]
+    caption: Option<String>,
+
     /// Original message if this is a reply.
     reply_to_message: Option<Box<TelegramMessage>>,
 
@@ -160,6 +164,21 @@ const POLLING_STATE_PATH: &str = "state/last_update_id";
 /// Workspace path for persisting owner_id across WASM callbacks.
 const OWNER_ID_PATH: &str = "state/owner_id";
 
+/// Workspace path for persisting dm_policy across WASM callbacks.
+const DM_POLICY_PATH: &str = "state/dm_policy";
+
+/// Workspace path for persisting allow_from (JSON array) across WASM callbacks.
+const ALLOW_FROM_PATH: &str = "state/allow_from";
+
+/// Channel name for pairing store (used by pairing host APIs).
+const CHANNEL_NAME: &str = "telegram";
+
+/// Workspace path for persisting bot_username for mention detection in groups.
+const BOT_USERNAME_PATH: &str = "state/bot_username";
+
+/// Workspace path for persisting respond_to_all_group_messages flag.
+const RESPOND_TO_ALL_GROUP_PATH: &str = "state/respond_to_all_group_messages";
+
 // ============================================================================
 // Channel Metadata
 // ============================================================================
@@ -195,6 +214,14 @@ struct TelegramConfig {
     /// user are processed. All others are silently dropped.
     #[serde(default)]
     owner_id: Option<i64>,
+
+    /// DM policy: "pairing" (default), "allowlist", or "open".
+    #[serde(default)]
+    dm_policy: Option<String>,
+
+    /// Allowed sender IDs/usernames from config (merged with pairing-approved store).
+    #[serde(default)]
+    allow_from: Option<Vec<String>>,
 
     /// Whether to respond to all group messages (not just mentions).
     #[serde(default)]
@@ -256,6 +283,28 @@ impl Guest for TelegramChannel {
                 "No owner_id configured, bot is open to all users",
             );
         }
+
+        // Persist dm_policy and allow_from for DM pairing in handle_message
+        let dm_policy = config
+            .dm_policy
+            .as_deref()
+            .unwrap_or("pairing")
+            .to_string();
+        let _ = channel_host::workspace_write(DM_POLICY_PATH, &dm_policy);
+
+        let allow_from_json = serde_json::to_string(&config.allow_from.unwrap_or_default())
+            .unwrap_or_else(|_| "[]".to_string());
+        let _ = channel_host::workspace_write(ALLOW_FROM_PATH, &allow_from_json);
+
+        // Persist bot_username and respond_to_all_group_messages for group handling
+        let _ = channel_host::workspace_write(
+            BOT_USERNAME_PATH,
+            &config.bot_username.unwrap_or_default(),
+        );
+        let _ = channel_host::workspace_write(
+            RESPOND_TO_ALL_GROUP_PATH,
+            &config.respond_to_all_group_messages.to_string(),
+        );
 
         // Mode is determined by whether the host injected a tunnel_url
         // If tunnel is configured, use webhooks. Otherwise, use polling.
@@ -388,7 +437,9 @@ impl Guest for TelegramChannel {
 
         let headers = serde_json::json!({});
 
-        let result = channel_host::http_request("GET", &url, &headers.to_string(), None);
+        // 35s HTTP timeout outlives Telegram's 30s server-side long-poll
+        let result =
+            channel_host::http_request("GET", &url, &headers.to_string(), None, Some(35_000));
 
         match result {
             Ok(response) => {
@@ -461,72 +512,52 @@ impl Guest for TelegramChannel {
     }
 
     fn on_respond(response: AgentResponse) -> Result<(), String> {
-        // Parse metadata to get chat info
         let metadata: TelegramMessageMetadata = serde_json::from_str(&response.metadata_json)
             .map_err(|e| format!("Failed to parse metadata: {}", e))?;
 
-        // Build sendMessage payload
-        let mut payload = serde_json::json!({
-            "chat_id": metadata.chat_id,
-            "text": response.content,
-            "parse_mode": "Markdown",
-        });
-
-        // Reply to the original message for context
-        payload["reply_to_message_id"] = serde_json::Value::Number(metadata.message_id.into());
-
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|e| format!("Failed to serialize payload: {}", e))?;
-
-        // Make HTTP request to Telegram API
-        // The bot token is injected into the URL by the host
-        let headers = serde_json::json!({
-            "Content-Type": "application/json"
-        });
-
-        let result = channel_host::http_request(
-            "POST",
-            "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            &headers.to_string(),
-            Some(&payload_bytes),
+        // Try sending with Markdown first; fall back to plain text if Telegram
+        // can't parse the entities (e.g. model leaked <tool_call> with underscores).
+        let result = send_message(
+            metadata.chat_id,
+            &response.content,
+            metadata.message_id,
+            Some("Markdown"),
         );
 
         match result {
-            Ok(http_response) => {
-                if http_response.status != 200 {
-                    let body_str = String::from_utf8_lossy(&http_response.body);
-                    return Err(format!(
-                        "Telegram API returned status {}: {}",
-                        http_response.status, body_str
-                    ));
-                }
-
-                // Parse Telegram response
-                let api_response: TelegramApiResponse<SentMessage> =
-                    serde_json::from_slice(&http_response.body)
-                        .map_err(|e| format!("Failed to parse Telegram response: {}", e))?;
-
-                if !api_response.ok {
-                    return Err(format!(
-                        "Telegram API error: {}",
-                        api_response
-                            .description
-                            .unwrap_or_else(|| "unknown".to_string())
-                    ));
-                }
-
+            Ok(msg_id) => {
                 channel_host::log(
                     channel_host::LogLevel::Debug,
                     &format!(
                         "Sent message to chat {}: message_id={}",
-                        metadata.chat_id,
-                        api_response.result.map(|r| r.message_id).unwrap_or(0)
+                        metadata.chat_id, msg_id
                     ),
                 );
-
                 Ok(())
             }
-            Err(e) => Err(format!("HTTP request failed: {}", e)),
+            Err(SendError::ParseEntities(detail)) => {
+                channel_host::log(
+                    channel_host::LogLevel::Warn,
+                    &format!("Markdown parse failed ({}), retrying as plain text", detail),
+                );
+                let msg_id = send_message(
+                    metadata.chat_id,
+                    &response.content,
+                    metadata.message_id,
+                    None,
+                )
+                .map_err(|e| format!("Plain-text retry also failed: {}", e))?;
+
+                channel_host::log(
+                    channel_host::LogLevel::Debug,
+                    &format!(
+                        "Sent plain-text message to chat {}: message_id={}",
+                        metadata.chat_id, msg_id
+                    ),
+                );
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -568,6 +599,7 @@ impl Guest for TelegramChannel {
             "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendChatAction",
             &headers.to_string(),
             Some(&payload_bytes),
+            None,
         );
 
         if let Err(e) = result {
@@ -583,6 +615,101 @@ impl Guest for TelegramChannel {
             channel_host::LogLevel::Info,
             "Telegram channel shutting down",
         );
+    }
+}
+
+// ============================================================================
+// Send Message Helper
+// ============================================================================
+
+/// Errors from send_message, split so callers can match on parse-entity failures.
+enum SendError {
+    /// Telegram returned 400 with "can't parse entities" (Markdown issue).
+    ParseEntities(String),
+    /// Any other failure.
+    Other(String),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendError::ParseEntities(detail) => write!(f, "parse entities error: {}", detail),
+            SendError::Other(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+/// Send a message via the Telegram Bot API.
+///
+/// Returns the sent message_id on success. When `parse_mode` is set and
+/// Telegram returns a 400 "can't parse entities" error, returns
+/// `SendError::ParseEntities` so the caller can retry without formatting.
+fn send_message(
+    chat_id: i64,
+    text: &str,
+    reply_to_message_id: i64,
+    parse_mode: Option<&str>,
+) -> Result<i64, SendError> {
+    let mut payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "reply_to_message_id": reply_to_message_id,
+    });
+
+    if let Some(mode) = parse_mode {
+        payload["parse_mode"] = serde_json::Value::String(mode.to_string());
+    }
+
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|e| SendError::Other(format!("Failed to serialize payload: {}", e)))?;
+
+    let headers = serde_json::json!({ "Content-Type": "application/json" });
+
+    let result = channel_host::http_request(
+        "POST",
+        "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        &headers.to_string(),
+        Some(&payload_bytes),
+        None,
+    );
+
+    match result {
+        Ok(http_response) => {
+            if http_response.status == 400 {
+                let body_str = String::from_utf8_lossy(&http_response.body);
+                if body_str.contains("can't parse entities") {
+                    return Err(SendError::ParseEntities(body_str.to_string()));
+                }
+                return Err(SendError::Other(format!(
+                    "Telegram API returned 400: {}",
+                    body_str
+                )));
+            }
+
+            if http_response.status != 200 {
+                let body_str = String::from_utf8_lossy(&http_response.body);
+                return Err(SendError::Other(format!(
+                    "Telegram API returned status {}: {}",
+                    http_response.status, body_str
+                )));
+            }
+
+            let api_response: TelegramApiResponse<SentMessage> =
+                serde_json::from_slice(&http_response.body)
+                    .map_err(|e| SendError::Other(format!("Failed to parse response: {}", e)))?;
+
+            if !api_response.ok {
+                return Err(SendError::Other(format!(
+                    "Telegram API error: {}",
+                    api_response
+                        .description
+                        .unwrap_or_else(|| "unknown".to_string())
+                )));
+            }
+
+            Ok(api_response.result.map(|r| r.message_id).unwrap_or(0))
+        }
+        Err(e) => Err(SendError::Other(format!("HTTP request failed: {}", e))),
     }
 }
 
@@ -603,6 +730,7 @@ fn delete_webhook() -> Result<(), String> {
         "POST",
         "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
         &headers.to_string(),
+        None,
         None,
     );
 
@@ -666,6 +794,7 @@ fn register_webhook(tunnel_url: &str, webhook_secret: Option<&str>) -> Result<()
         "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
         &headers.to_string(),
         Some(&body_bytes),
+        None,
     );
 
     match result {
@@ -701,6 +830,48 @@ fn register_webhook(tunnel_url: &str, webhook_secret: Option<&str>) -> Result<()
 }
 
 // ============================================================================
+// Pairing Reply
+// ============================================================================
+
+/// Send a pairing code message to a chat. Used when an unknown user DMs the bot.
+fn send_pairing_reply(chat_id: i64, code: &str) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "chat_id": chat_id,
+        "text": format!(
+            "To pair with this bot, run: `ironclaw pairing approve telegram {}`",
+            code
+        ),
+        "parse_mode": "Markdown",
+    });
+
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|e| format!("Failed to serialize payload: {}", e))?;
+
+    let headers = serde_json::json!({
+        "Content-Type": "application/json"
+    });
+
+    let result = channel_host::http_request(
+        "POST",
+        "https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        &headers.to_string(),
+        Some(&payload_bytes),
+        None,
+    );
+
+    match result {
+        Ok(response) => {
+            if response.status != 200 {
+                let body_str = String::from_utf8_lossy(&response.body);
+                return Err(format!("HTTP {}: {}", response.status, body_str));
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("HTTP request failed: {}", e)),
+    }
+}
+
+// ============================================================================
 // Update Handling
 // ============================================================================
 
@@ -719,11 +890,16 @@ fn handle_update(update: TelegramUpdate) {
 
 /// Process a single message.
 fn handle_message(message: TelegramMessage) {
-    // Skip messages without text
-    let text = match message.text {
-        Some(t) if !t.is_empty() => t,
-        _ => return,
-    };
+    // Use text or caption (for media messages)
+    let content = message
+        .text
+        .filter(|t| !t.is_empty())
+        .or_else(|| message.caption.filter(|c| !c.is_empty()))
+        .unwrap_or_default();
+
+    if content.is_empty() {
+        return;
+    }
 
     // Skip messages without a sender (channel posts)
     let from = match message.from {
@@ -736,41 +912,111 @@ fn handle_message(message: TelegramMessage) {
         return;
     }
 
-    // Owner validation: silently drop messages from non-owner users
-    if let Some(owner_id_str) = channel_host::workspace_read(OWNER_ID_PATH) {
-        if !owner_id_str.is_empty() {
-            if let Ok(owner_id) = owner_id_str.parse::<i64>() {
-                if from.id != owner_id {
-                    channel_host::log(
-                        channel_host::LogLevel::Debug,
-                        &format!(
-                            "Dropping message from non-owner user {} (owner: {})",
-                            from.id, owner_id
-                        ),
-                    );
-                    return;
+    let is_private = message.chat.chat_type == "private";
+
+    // Owner validation: when owner_id is set, only that user can message
+    let owner_configured = channel_host::workspace_read(OWNER_ID_PATH)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    if owner_configured {
+        if let Ok(owner_id) = channel_host::workspace_read(OWNER_ID_PATH)
+            .unwrap()
+            .parse::<i64>()
+        {
+            if from.id != owner_id {
+                channel_host::log(
+                    channel_host::LogLevel::Debug,
+                    &format!(
+                        "Dropping message from non-owner user {} (owner: {})",
+                        from.id, owner_id
+                    ),
+                );
+                return;
+            }
+        }
+    } else if is_private {
+        // No owner_id: apply dm_policy for private chats
+        let dm_policy = channel_host::workspace_read(DM_POLICY_PATH)
+            .unwrap_or_else(|| "pairing".to_string());
+
+        if dm_policy != "open" {
+            // Build effective allow list: config allow_from + pairing store
+            let mut allowed: Vec<String> = channel_host::workspace_read(ALLOW_FROM_PATH)
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+
+            if let Ok(store_allowed) = channel_host::pairing_read_allow_from(CHANNEL_NAME) {
+                allowed.extend(store_allowed);
+            }
+
+            let id_str = from.id.to_string();
+            let username_opt = from.username.as_deref();
+            let is_allowed = allowed.contains(&"*".to_string())
+                || allowed.contains(&id_str)
+                || username_opt.map_or(false, |u| allowed.contains(&u.to_string()));
+
+            if !is_allowed {
+                if dm_policy == "pairing" {
+                    // Upsert pairing request and send reply
+                    let meta = serde_json::json!({
+                        "chat_id": message.chat.id,
+                        "user_id": from.id,
+                        "username": username_opt,
+                    })
+                    .to_string();
+
+                    match channel_host::pairing_upsert_request(CHANNEL_NAME, &id_str, &meta) {
+                        Ok(result) => {
+                            channel_host::log(
+                                channel_host::LogLevel::Info,
+                                &format!(
+                                    "Pairing request for user {} (chat {}): code {}",
+                                    from.id, message.chat.id, result.code
+                                ),
+                            );
+                            if result.created {
+                                let _ = send_pairing_reply(message.chat.id, &result.code);
+                            }
+                        }
+                        Err(e) => {
+                            channel_host::log(
+                                channel_host::LogLevel::Error,
+                                &format!("Pairing upsert failed: {}", e),
+                            );
+                        }
+                    }
                 }
+                return;
             }
         }
     }
 
-    let is_private = message.chat.chat_type == "private";
-
-    // For group chats, check if the bot was mentioned
-    // TODO: Read bot_username from config and check mentions
-    // For now, process all messages in private chats and groups
+    // For group chats, only respond if bot was mentioned or respond_to_all is enabled
     if !is_private {
-        // In groups, only respond if there's a bot mention or command
-        // This is a simplified check - proper implementation would use entities
-        let has_command = text.starts_with('/');
-        let has_mention = text.contains('@');
+        let respond_to_all = channel_host::workspace_read(RESPOND_TO_ALL_GROUP_PATH)
+            .as_deref()
+            .unwrap_or("false")
+            == "true";
 
-        if !has_command && !has_mention {
-            channel_host::log(
-                channel_host::LogLevel::Debug,
-                &format!("Ignoring group message without mention: {}", text),
-            );
-            return;
+        if !respond_to_all {
+            let has_command = content.starts_with('/');
+            let bot_username = channel_host::workspace_read(BOT_USERNAME_PATH)
+                .unwrap_or_default();
+            let has_bot_mention = if bot_username.is_empty() {
+                content.contains('@')
+            } else {
+                let mention = format!("@{}", bot_username);
+                content.to_lowercase().contains(&mention.to_lowercase())
+            };
+
+            if !has_command && !has_bot_mention {
+                channel_host::log(
+                    channel_host::LogLevel::Debug,
+                    &format!("Ignoring group message without mention: {}", content),
+                );
+                return;
+            }
         }
     }
 
@@ -792,17 +1038,30 @@ fn handle_message(message: TelegramMessage) {
     let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
 
     // Clean the message text (strip bot mentions and commands)
-    let cleaned_text = clean_message_text(&text);
+    let bot_username = channel_host::workspace_read(BOT_USERNAME_PATH).unwrap_or_default();
+    let cleaned_text = clean_message_text(
+        &content,
+        if bot_username.is_empty() {
+            None
+        } else {
+            Some(bot_username.as_str())
+        },
+    );
 
-    if cleaned_text.is_empty() {
+    // For /start with no args, emit placeholder so agent can respond with welcome
+    let content_to_emit = if cleaned_text.is_empty() && content.trim().starts_with('/') {
+        "[User started the bot]".to_string()
+    } else if cleaned_text.is_empty() {
         return;
-    }
+    } else {
+        cleaned_text
+    };
 
     // Emit the message to the agent
     channel_host::emit_message(&EmittedMessage {
         user_id: from.id.to_string(),
         user_name: Some(user_name),
-        content: cleaned_text,
+        content: content_to_emit,
         thread_id: None, // Telegram doesn't have threads in the same way
         metadata_json,
     });
@@ -817,7 +1076,8 @@ fn handle_message(message: TelegramMessage) {
 }
 
 /// Clean message text by removing bot commands and @mentions at the start.
-fn clean_message_text(text: &str) -> String {
+/// When bot_username is set, only strips that specific mention; otherwise strips any leading @mention.
+fn clean_message_text(text: &str, bot_username: Option<&str>) -> String {
     let mut result = text.trim().to_string();
 
     // Remove leading /command
@@ -832,11 +1092,30 @@ fn clean_message_text(text: &str) -> String {
 
     // Remove leading @mention
     if result.starts_with('@') {
-        if let Some(space_idx) = result.find(' ') {
-            result = result[space_idx..].trim_start().to_string();
+        if let Some(bot) = bot_username {
+            let mention = format!("@{}", bot);
+            let mention_lower = mention.to_lowercase();
+            let result_lower = result.to_lowercase();
+            if result_lower.starts_with(&mention_lower) {
+                let rest = result[mention.len()..].trim_start();
+                if rest.is_empty() {
+                    return String::new();
+                }
+                result = rest.to_string();
+            } else if let Some(space_idx) = result.find(' ') {
+                // Different leading @mention - only strip if it's the bot
+                let first_word = &result[..space_idx];
+                if first_word.eq_ignore_ascii_case(&mention) {
+                    result = result[space_idx..].trim_start().to_string();
+                }
+            }
         } else {
-            // Just a mention with no text
-            return String::new();
+            // No bot_username: strip any leading @mention
+            if let Some(space_idx) = result.find(' ') {
+                result = result[space_idx..].trim_start().to_string();
+            } else {
+                return String::new();
+            }
         }
     }
 
@@ -872,12 +1151,22 @@ mod tests {
 
     #[test]
     fn test_clean_message_text() {
-        assert_eq!(clean_message_text("/start hello"), "hello");
-        assert_eq!(clean_message_text("@bot hello world"), "hello world");
-        assert_eq!(clean_message_text("/start"), "");
-        assert_eq!(clean_message_text("@botname"), "");
-        assert_eq!(clean_message_text("just text"), "just text");
-        assert_eq!(clean_message_text("  spaced  "), "spaced");
+        // Without bot_username: strips any leading @mention
+        assert_eq!(clean_message_text("/start hello", None), "hello");
+        assert_eq!(clean_message_text("@bot hello world", None), "hello world");
+        assert_eq!(clean_message_text("/start", None), "");
+        assert_eq!(clean_message_text("@botname", None), "");
+        assert_eq!(clean_message_text("just text", None), "just text");
+        assert_eq!(clean_message_text("  spaced  ", None), "spaced");
+
+        // With bot_username: only strips @MyBot, not @alice
+        assert_eq!(clean_message_text("@MyBot hello", Some("MyBot")), "hello");
+        assert_eq!(clean_message_text("@mybot hi", Some("MyBot")), "hi");
+        assert_eq!(
+            clean_message_text("@alice hello", Some("MyBot")),
+            "@alice hello"
+        );
+        assert_eq!(clean_message_text("@MyBot", Some("MyBot")), "");
     }
 
     #[test]
@@ -944,5 +1233,18 @@ mod tests {
         let from = message.from.unwrap();
         assert_eq!(from.id, 789);
         assert_eq!(from.first_name, "John");
+    }
+
+    #[test]
+    fn test_parse_message_with_caption() {
+        let json = r#"{
+            "message_id": 1,
+            "from": {"id": 1, "is_bot": false, "first_name": "A"},
+            "chat": {"id": 1, "type": "private"},
+            "caption": "What's in this image?"
+        }"#;
+        let msg: TelegramMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.text, None);
+        assert_eq!(msg.caption.as_deref(), Some("What's in this image?"));
     }
 }

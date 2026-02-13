@@ -79,63 +79,63 @@ impl Scheduler {
 
     /// Schedule a job for execution.
     pub async fn schedule(&self, job_id: Uuid) -> Result<(), JobError> {
-        // Check if already scheduled
-        if self.jobs.read().await.contains_key(&job_id) {
-            return Ok(());
-        }
+        // Hold write lock for the entire check-insert sequence to prevent
+        // TOCTOU races where two concurrent calls both pass the checks.
+        {
+            let mut jobs = self.jobs.write().await;
 
-        // Check capacity
-        let current_count = self.jobs.read().await.len();
-        if current_count >= self.config.max_parallel_jobs {
-            return Err(JobError::MaxJobsExceeded {
-                max: self.config.max_parallel_jobs,
-            });
-        }
-
-        // Transition job to in_progress
-        self.context_manager
-            .update_context(job_id, |ctx| {
-                ctx.transition_to(
-                    JobState::InProgress,
-                    Some("Scheduled for execution".to_string()),
-                )
-            })
-            .await?
-            .map_err(|s| JobError::ContextError {
-                id: job_id,
-                reason: s,
-            })?;
-
-        // Create worker channel
-        let (tx, rx) = mpsc::channel(16);
-
-        // Create worker with shared dependencies
-        let deps = WorkerDeps {
-            context_manager: self.context_manager.clone(),
-            llm: self.llm.clone(),
-            safety: self.safety.clone(),
-            tools: self.tools.clone(),
-            store: self.store.clone(),
-            timeout: self.config.job_timeout,
-            use_planning: self.config.use_planning,
-        };
-        let worker = Worker::new(job_id, deps);
-
-        // Spawn worker task
-        let handle = tokio::spawn(async move {
-            if let Err(e) = worker.run(rx).await {
-                tracing::error!("Worker for job {} failed: {}", job_id, e);
+            if jobs.contains_key(&job_id) {
+                return Ok(());
             }
-        });
 
-        // Start the worker
-        let _ = tx.send(WorkerMessage::Start).await;
+            if jobs.len() >= self.config.max_parallel_jobs {
+                return Err(JobError::MaxJobsExceeded {
+                    max: self.config.max_parallel_jobs,
+                });
+            }
 
-        // Store the scheduled job
-        self.jobs
-            .write()
-            .await
-            .insert(job_id, ScheduledJob { handle, tx });
+            // Transition job to in_progress
+            self.context_manager
+                .update_context(job_id, |ctx| {
+                    ctx.transition_to(
+                        JobState::InProgress,
+                        Some("Scheduled for execution".to_string()),
+                    )
+                })
+                .await?
+                .map_err(|s| JobError::ContextError {
+                    id: job_id,
+                    reason: s,
+                })?;
+
+            // Create worker channel
+            let (tx, rx) = mpsc::channel(16);
+
+            // Create worker with shared dependencies
+            let deps = WorkerDeps {
+                context_manager: self.context_manager.clone(),
+                llm: self.llm.clone(),
+                safety: self.safety.clone(),
+                tools: self.tools.clone(),
+                store: self.store.clone(),
+                timeout: self.config.job_timeout,
+                use_planning: self.config.use_planning,
+            };
+            let worker = Worker::new(job_id, deps);
+
+            // Spawn worker task
+            let handle = tokio::spawn(async move {
+                if let Err(e) = worker.run(rx).await {
+                    tracing::error!("Worker for job {} failed: {}", job_id, e);
+                }
+            });
+
+            // Start the worker
+            let _ = tx.send(WorkerMessage::Start).await;
+
+            // Insert while still holding the write lock
+            jobs.insert(job_id, ScheduledJob { handle, tx });
+        }
 
         // Cleanup task for this job to avoid capacity leaks
         let jobs = Arc::clone(&self.jobs);
@@ -373,23 +373,23 @@ impl Scheduler {
             .into());
         }
 
-        // Execute with timeout
-        let result = tokio::time::timeout(Duration::from_secs(60), async {
-            tool.execute(params, &job_ctx).await
-        })
-        .await
-        .map_err(|_| {
-            Error::Tool(crate::error::ToolError::Timeout {
-                name: tool_name.to_string(),
-                timeout: Duration::from_secs(60),
-            })
-        })?
-        .map_err(|e| {
-            Error::Tool(crate::error::ToolError::ExecutionFailed {
-                name: tool_name.to_string(),
-                reason: e.to_string(),
-            })
-        })?;
+        // Execute with per-tool timeout
+        let tool_timeout = tool.execution_timeout();
+        let result =
+            tokio::time::timeout(tool_timeout, async { tool.execute(params, &job_ctx).await })
+                .await
+                .map_err(|_| {
+                    Error::Tool(crate::error::ToolError::Timeout {
+                        name: tool_name.to_string(),
+                        timeout: tool_timeout,
+                    })
+                })?
+                .map_err(|e| {
+                    Error::Tool(crate::error::ToolError::ExecutionFailed {
+                        name: tool_name.to_string(),
+                        reason: e.to_string(),
+                    })
+                })?;
 
         Ok(TaskOutput::new(result.result, start.elapsed()))
     }

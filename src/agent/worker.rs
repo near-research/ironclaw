@@ -248,16 +248,15 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
             if selections.is_empty() {
                 // No tools from select_tools, ask LLM directly (may still return tool calls)
-                let respond_result = reasoning.respond_with_tools(reason_ctx).await?;
+                let respond_output = reasoning.respond_with_tools(reason_ctx).await?;
 
-                match respond_result {
+                match respond_output.result {
                     RespondResult::Text(response) => {
-                        // Check for completion keywords
-                        let response_lower = response.to_lowercase();
-                        if response_lower.contains("complete")
-                            || response_lower.contains("finished")
-                            || response_lower.contains("done")
-                        {
+                        // Check for explicit completion phrases. Use word-boundary
+                        // aware checks to avoid false positives like "incomplete",
+                        // "not done", or "unfinished". Only the LLM's own response
+                        // (not tool output) can trigger this.
+                        if crate::util::llm_signals_completion(&response) {
                             self.mark_completed().await?;
                             return Ok(());
                         }
@@ -272,13 +271,24 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             ));
                         }
                     }
-                    RespondResult::ToolCalls(tool_calls) => {
+                    RespondResult::ToolCalls {
+                        tool_calls,
+                        content,
+                    } => {
                         // Model returned tool calls - execute them
                         tracing::debug!(
                             "Job {} respond_with_tools returned {} tool calls",
                             self.job_id,
                             tool_calls.len()
                         );
+
+                        // Add assistant message with tool_calls (OpenAI protocol)
+                        reason_ctx
+                            .messages
+                            .push(ChatMessage::assistant_with_tool_calls(
+                                content,
+                                tool_calls.clone(),
+                            ));
 
                         for tc in tool_calls {
                             let result = self.execute_tool(&tc.name, &tc.arguments).await;
@@ -417,13 +427,50 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             .into());
         }
 
-        // Execute with timeout and timing
+        tracing::debug!(
+            tool = %tool_name,
+            params = %params,
+            job = %job_id,
+            "Tool call started"
+        );
+
+        // Execute with per-tool timeout and timing
+        let tool_timeout = tool.execution_timeout();
         let start = std::time::Instant::now();
-        let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let result = tokio::time::timeout(tool_timeout, async {
             tool.execute(params.clone(), &job_ctx).await
         })
         .await;
         let elapsed = start.elapsed();
+
+        match &result {
+            Ok(Ok(output)) => {
+                let result_str = serde_json::to_string(&output.result)
+                    .unwrap_or_else(|_| "<serialize error>".to_string());
+                tracing::debug!(
+                    tool = %tool_name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    result = %result_str,
+                    "Tool call succeeded"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    tool = %tool_name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    error = %e,
+                    "Tool call failed"
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    tool = %tool_name,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    timeout_secs = tool_timeout.as_secs(),
+                    "Tool call timed out"
+                );
+            }
+        }
 
         // Record action in memory and get the ActionRecord for persistence
         let action = match &result {
@@ -479,7 +526,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let output = result
             .map_err(|_| crate::error::ToolError::Timeout {
                 name: tool_name.to_string(),
-                timeout: Duration::from_secs(60),
+                timeout: tool_timeout,
             })?
             .map_err(|e| crate::error::ToolError::ExecutionFailed {
                 name: tool_name.to_string(),
@@ -523,12 +570,9 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     wrapped,
                 ));
 
-                // Check if job is complete
-                if output.contains("TASK_COMPLETE") || output.contains("JOB_DONE") {
-                    self.mark_completed().await?;
-                    return Ok(true);
-                }
-
+                // Tool output never drives job completion. A malicious tool could
+                // emit "TASK_COMPLETE" to force premature completion. Only the LLM's
+                // own structured response (in execution_loop) can mark a job done.
                 Ok(false)
             }
             Err(e) => {
@@ -632,11 +676,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let response = reasoning.respond(reason_ctx).await?;
         reason_ctx.messages.push(ChatMessage::assistant(&response));
 
-        let response_lower = response.to_lowercase();
-        if response_lower.contains("complete")
-            || response_lower.contains("finished")
-            || response_lower.contains("done")
-        {
+        if crate::util::llm_signals_completion(&response) {
             self.mark_completed().await?;
         } else {
             // Job not complete, could re-plan or fall back to direct selection
@@ -729,5 +769,70 @@ impl From<TaskOutput> for Result<String, Error> {
             }
             .into()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::util::llm_signals_completion;
+
+    #[test]
+    fn test_completion_positive_signals() {
+        assert!(llm_signals_completion("The job is complete."));
+        assert!(llm_signals_completion(
+            "I have completed the task successfully."
+        ));
+        assert!(llm_signals_completion("The task is done."));
+        assert!(llm_signals_completion("The task is finished."));
+        assert!(llm_signals_completion(
+            "All steps are complete and verified."
+        ));
+        assert!(llm_signals_completion(
+            "I've done all the work. The work is done."
+        ));
+        assert!(llm_signals_completion(
+            "Successfully completed the migration."
+        ));
+    }
+
+    #[test]
+    fn test_completion_negative_signals_block_false_positives() {
+        // These contain completion keywords but also negation, should NOT trigger.
+        assert!(!llm_signals_completion("The task is not complete yet."));
+        assert!(!llm_signals_completion("This is not done."));
+        assert!(!llm_signals_completion("The work is incomplete."));
+        assert!(!llm_signals_completion(
+            "The migration is not yet finished."
+        ));
+        assert!(!llm_signals_completion("The job isn't done yet."));
+        assert!(!llm_signals_completion("This remains unfinished."));
+    }
+
+    #[test]
+    fn test_completion_does_not_match_bare_substrings() {
+        // Bare words embedded in other text should NOT trigger completion.
+        assert!(!llm_signals_completion(
+            "I need to complete more work first."
+        ));
+        assert!(!llm_signals_completion(
+            "Let me finish the remaining steps."
+        ));
+        assert!(!llm_signals_completion(
+            "I'm done analyzing, now let me fix it."
+        ));
+        assert!(!llm_signals_completion(
+            "I completed step 1 but step 2 remains."
+        ));
+    }
+
+    #[test]
+    fn test_completion_tool_output_injection() {
+        // A malicious tool output echoed by the LLM should not trigger
+        // completion unless it forms a genuine completion phrase.
+        assert!(!llm_signals_completion("TASK_COMPLETE"));
+        assert!(!llm_signals_completion("JOB_DONE"));
+        assert!(!llm_signals_completion(
+            "The tool returned: TASK_COMPLETE signal"
+        ));
     }
 }

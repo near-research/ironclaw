@@ -1,4 +1,9 @@
 //! Configuration for IronClaw.
+//!
+//! Settings are loaded with priority: env var > database > default.
+//! The database replaces the old `settings.json` file for all settings
+//! except the 4 bootstrap fields (database_url, pool_size, secrets key
+//! source, onboard_completed) which live in `~/.ironclaw/bootstrap.json`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -6,6 +11,7 @@ use std::time::Duration;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::error::ConfigError;
+use crate::settings::Settings;
 
 /// Main configuration for the agent.
 #[derive(Debug, Clone)]
@@ -21,28 +27,67 @@ pub struct Config {
     pub secrets: SecretsConfig,
     pub builder: BuilderModeConfig,
     pub heartbeat: HeartbeatConfig,
+    pub routines: RoutineConfig,
     pub sandbox: SandboxModeConfig,
+    pub claude_code: ClaudeCodeConfig,
 }
 
 impl Config {
-    /// Load configuration from environment variables.
-    pub fn from_env() -> Result<Self, ConfigError> {
-        // Load .env file if present (ignore errors if not found)
+    /// Load configuration from environment variables and the database.
+    ///
+    /// Priority: env var > DB settings > default.
+    /// This is the primary way to load config after DB is connected.
+    pub async fn from_db(
+        store: &crate::history::Store,
+        user_id: &str,
+        bootstrap: &crate::bootstrap::BootstrapConfig,
+    ) -> Result<Self, ConfigError> {
         let _ = dotenvy::dotenv();
 
+        // Load all settings from DB into a Settings struct
+        let db_settings = match store.get_all_settings(user_id).await {
+            Ok(map) => Settings::from_db_map(&map),
+            Err(e) => {
+                tracing::warn!("Failed to load settings from DB, using defaults: {}", e);
+                Settings::default()
+            }
+        };
+
+        Self::build(bootstrap, &db_settings).await
+    }
+
+    /// Load configuration from environment variables only (no database).
+    ///
+    /// Used during early startup before the database is connected,
+    /// and by CLI commands that don't have DB access.
+    /// Falls back to legacy `settings.json` on disk if present.
+    pub async fn from_env() -> Result<Self, ConfigError> {
+        let _ = dotenvy::dotenv();
+        let bootstrap = crate::bootstrap::BootstrapConfig::load();
+        let settings = Settings::load();
+        Self::build(&bootstrap, &settings).await
+    }
+
+    /// Build config from bootstrap + settings (shared by from_env and from_db).
+    async fn build(
+        bootstrap: &crate::bootstrap::BootstrapConfig,
+        settings: &Settings,
+    ) -> Result<Self, ConfigError> {
         Ok(Self {
-            database: DatabaseConfig::from_env()?,
-            llm: LlmConfig::from_env()?,
-            embeddings: EmbeddingsConfig::from_env()?,
-            tunnel: TunnelConfig::from_env()?,
-            channels: ChannelsConfig::from_env()?,
-            agent: AgentConfig::from_env()?,
-            safety: SafetyConfig::from_env()?,
-            wasm: WasmConfig::from_env()?,
-            secrets: SecretsConfig::from_env()?,
-            builder: BuilderModeConfig::from_env()?,
-            heartbeat: HeartbeatConfig::from_env()?,
-            sandbox: SandboxModeConfig::from_env()?,
+            database: DatabaseConfig::resolve(bootstrap)?,
+            llm: LlmConfig::resolve(settings)?,
+            embeddings: EmbeddingsConfig::resolve(settings)?,
+            tunnel: TunnelConfig::resolve(settings)?,
+            channels: ChannelsConfig::resolve(settings)?,
+            agent: AgentConfig::resolve(settings)?,
+            safety: SafetyConfig::resolve()?,
+            wasm: WasmConfig::resolve()?,
+            secrets: SecretsConfig::resolve(bootstrap).await?,
+            builder: BuilderModeConfig::resolve()?,
+            heartbeat: HeartbeatConfig::resolve(settings)?,
+            routines: RoutineConfig::resolve()?,
+            sandbox: SandboxModeConfig::resolve()?,
+            claude_code: ClaudeCodeConfig::resolve()?,
         })
     }
 }
@@ -51,48 +96,17 @@ impl Config {
 ///
 /// Used by channels and tools that need public webhook endpoints.
 /// The tunnel URL is shared across all channels (Telegram, Slack, etc.).
-///
-/// # Security Notes
-///
-/// **Webhook endpoints** (e.g., `/webhook/telegram`) should NOT use tunnel-level
-/// authentication because webhook providers (Telegram, Slack, GitHub) need
-/// unauthenticated access to POST updates. Security for webhooks comes from:
-/// - Webhook signature verification (provider-specific secrets)
-/// - IP allowlisting (if supported by provider)
-///
-/// **Non-webhook endpoints** (admin APIs, health checks) CAN be protected using
-/// tunnel provider features:
-/// - ngrok: Basic Auth, OAuth, IP restrictions
-/// - Cloudflare: Access policies, mTLS
-///
-/// These protections are configured in the tunnel provider, not here.
-///
-/// # Supported Providers
-///
-/// - **ngrok**: `ngrok http 8080` -> `https://abc123.ngrok.io`
-/// - **Cloudflare Tunnel**: `cloudflared tunnel --url http://localhost:8080`
-/// - **localtunnel**: `lt --port 8080`
-/// - Any service that provides a public HTTPS URL to localhost
 #[derive(Debug, Clone, Default)]
 pub struct TunnelConfig {
     /// Public URL from tunnel provider (e.g., "https://abc123.ngrok.io").
-    ///
-    /// When set, channels that support webhooks will register their endpoints
-    /// with this base URL instead of using polling.
     pub public_url: Option<String>,
 }
 
 impl TunnelConfig {
-    fn from_env() -> Result<Self, ConfigError> {
-        // Priority: env var > settings file
-        let public_url = optional_env("TUNNEL_URL")?.or_else(|| {
-            crate::settings::Settings::load()
-                .tunnel
-                .public_url
-                .filter(|s| !s.is_empty())
-        });
+    fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
+        let public_url = optional_env("TUNNEL_URL")?
+            .or_else(|| settings.tunnel.public_url.clone().filter(|s| !s.is_empty()));
 
-        // Validate URL format if provided
         if let Some(ref url) = public_url {
             if !url.starts_with("https://") {
                 return Err(ConfigError::InvalidValue {
@@ -111,8 +125,6 @@ impl TunnelConfig {
     }
 
     /// Get the webhook URL for a given path.
-    ///
-    /// Returns `None` if no tunnel is configured.
     pub fn webhook_url(&self, path: &str) -> Option<String> {
         self.public_url.as_ref().map(|base| {
             let base = base.trim_end_matches('/');
@@ -130,18 +142,14 @@ pub struct DatabaseConfig {
 }
 
 impl DatabaseConfig {
-    fn from_env() -> Result<Self, ConfigError> {
-        let settings = crate::settings::Settings::load();
-
-        // Priority: env var > settings > error (required)
+    fn resolve(bootstrap: &crate::bootstrap::BootstrapConfig) -> Result<Self, ConfigError> {
         let url = optional_env("DATABASE_URL")?
-            .or(settings.database_url.clone())
+            .or_else(|| bootstrap.database_url.clone())
             .ok_or_else(|| ConfigError::MissingRequired {
                 key: "database_url".to_string(),
                 hint: "Run 'ironclaw onboard' or set DATABASE_URL environment variable".to_string(),
             })?;
 
-        // Priority: env var > settings > default
         let pool_size = optional_env("DATABASE_POOL_SIZE")?
             .map(|s| s.parse())
             .transpose()
@@ -149,7 +157,7 @@ impl DatabaseConfig {
                 key: "DATABASE_POOL_SIZE".to_string(),
                 message: format!("must be a positive integer: {e}"),
             })?
-            .or(settings.database_pool_size)
+            .or(bootstrap.database_pool_size)
             .unwrap_or(10);
 
         Ok(Self {
@@ -164,10 +172,102 @@ impl DatabaseConfig {
     }
 }
 
-/// LLM provider configuration (NEAR AI only).
+/// Which LLM backend to use.
+///
+/// Defaults to `NearAi` to keep IronClaw close to the NEAR ecosystem.
+/// Users can override with `LLM_BACKEND` env var to use their own API keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LlmBackend {
+    /// NEAR AI proxy (default) -- session or API key auth
+    #[default]
+    NearAi,
+    /// Direct OpenAI API
+    OpenAi,
+    /// Direct Anthropic API
+    Anthropic,
+    /// Local Ollama instance
+    Ollama,
+    /// Any OpenAI-compatible endpoint (e.g. vLLM, LiteLLM, Together)
+    OpenAiCompatible,
+}
+
+impl std::str::FromStr for LlmBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "nearai" | "near_ai" | "near" => Ok(Self::NearAi),
+            "openai" | "open_ai" => Ok(Self::OpenAi),
+            "anthropic" | "claude" => Ok(Self::Anthropic),
+            "ollama" => Ok(Self::Ollama),
+            "openai_compatible" | "openai-compatible" | "compatible" => Ok(Self::OpenAiCompatible),
+            _ => Err(format!(
+                "invalid LLM backend '{}', expected one of: nearai, openai, anthropic, ollama, openai_compatible",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for LlmBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NearAi => write!(f, "nearai"),
+            Self::OpenAi => write!(f, "openai"),
+            Self::Anthropic => write!(f, "anthropic"),
+            Self::Ollama => write!(f, "ollama"),
+            Self::OpenAiCompatible => write!(f, "openai_compatible"),
+        }
+    }
+}
+
+/// Configuration for direct OpenAI API access.
+#[derive(Debug, Clone)]
+pub struct OpenAiDirectConfig {
+    pub api_key: SecretString,
+    pub model: String,
+}
+
+/// Configuration for direct Anthropic API access.
+#[derive(Debug, Clone)]
+pub struct AnthropicDirectConfig {
+    pub api_key: SecretString,
+    pub model: String,
+}
+
+/// Configuration for local Ollama.
+#[derive(Debug, Clone)]
+pub struct OllamaConfig {
+    pub base_url: String,
+    pub model: String,
+}
+
+/// Configuration for any OpenAI-compatible endpoint.
+#[derive(Debug, Clone)]
+pub struct OpenAiCompatibleConfig {
+    pub base_url: String,
+    pub api_key: Option<SecretString>,
+    pub model: String,
+}
+
+/// LLM provider configuration.
+///
+/// NEAR AI remains the default backend. Users can switch to other providers
+/// by setting `LLM_BACKEND` (e.g. `openai`, `anthropic`, `ollama`).
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
+    /// Which backend to use (default: NearAi)
+    pub backend: LlmBackend,
+    /// NEAR AI config (always populated for NEAR AI embeddings, etc.)
     pub nearai: NearAiConfig,
+    /// Direct OpenAI config (populated when backend=openai)
+    pub openai: Option<OpenAiDirectConfig>,
+    /// Direct Anthropic config (populated when backend=anthropic)
+    pub anthropic: Option<AnthropicDirectConfig>,
+    /// Ollama config (populated when backend=ollama)
+    pub ollama: Option<OllamaConfig>,
+    /// OpenAI-compatible config (populated when backend=openai_compatible)
+    pub openai_compatible: Option<OpenAiCompatibleConfig>,
 }
 
 /// API mode for NEAR AI.
@@ -215,42 +315,110 @@ pub struct NearAiConfig {
 }
 
 impl LlmConfig {
-    fn from_env() -> Result<Self, ConfigError> {
-        let api_key = optional_env("NEARAI_API_KEY")?.map(SecretString::from);
+    fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
+        // Determine backend (default: NearAi)
+        let backend: LlmBackend = if let Some(b) = optional_env("LLM_BACKEND")? {
+            b.parse().map_err(|e| ConfigError::InvalidValue {
+                key: "LLM_BACKEND".to_string(),
+                message: e,
+            })?
+        } else {
+            LlmBackend::NearAi
+        };
 
-        // Determine API mode: explicit setting, or infer from API key presence
+        // Always resolve NEAR AI config (used as fallback and for embeddings)
+        let nearai_api_key = optional_env("NEARAI_API_KEY")?.map(SecretString::from);
+
         let api_mode = if let Some(mode_str) = optional_env("NEARAI_API_MODE")? {
             mode_str.parse().map_err(|e| ConfigError::InvalidValue {
                 key: "NEARAI_API_MODE".to_string(),
                 message: e,
             })?
-        } else if api_key.is_some() {
-            // If API key is provided, default to chat_completions mode
+        } else if nearai_api_key.is_some() {
             NearAiApiMode::ChatCompletions
         } else {
             NearAiApiMode::Responses
         };
 
-        Ok(Self {
-            nearai: NearAiConfig {
-                // Load model from saved settings first, then env, then default
-                model: crate::settings::Settings::load()
-                    .selected_model
-                    .or_else(|| optional_env("NEARAI_MODEL").ok().flatten())
-                    .unwrap_or_else(|| {
-                        "fireworks::accounts/fireworks/models/llama4-maverick-instruct-basic"
-                            .to_string()
-                    }),
-                base_url: optional_env("NEARAI_BASE_URL")?
-                    .unwrap_or_else(|| "https://cloud-api.near.ai".to_string()),
-                auth_base_url: optional_env("NEARAI_AUTH_URL")?
-                    .unwrap_or_else(|| "https://private.near.ai".to_string()),
-                session_path: optional_env("NEARAI_SESSION_PATH")?
-                    .map(PathBuf::from)
-                    .unwrap_or_else(default_session_path),
-                api_mode,
+        let nearai = NearAiConfig {
+            model: optional_env("NEARAI_MODEL")?
+                .or_else(|| settings.selected_model.clone())
+                .unwrap_or_else(|| {
+                    "fireworks::accounts/fireworks/models/llama4-maverick-instruct-basic"
+                        .to_string()
+                }),
+            base_url: optional_env("NEARAI_BASE_URL")?
+                .unwrap_or_else(|| "https://cloud-api.near.ai".to_string()),
+            auth_base_url: optional_env("NEARAI_AUTH_URL")?
+                .unwrap_or_else(|| "https://private.near.ai".to_string()),
+            session_path: optional_env("NEARAI_SESSION_PATH")?
+                .map(PathBuf::from)
+                .unwrap_or_else(default_session_path),
+            api_mode,
+            api_key: nearai_api_key,
+        };
+
+        // Resolve provider-specific configs based on backend
+        let openai = if backend == LlmBackend::OpenAi {
+            let api_key = optional_env("OPENAI_API_KEY")?
+                .map(SecretString::from)
+                .ok_or_else(|| ConfigError::MissingRequired {
+                    key: "OPENAI_API_KEY".to_string(),
+                    hint: "Set OPENAI_API_KEY when LLM_BACKEND=openai".to_string(),
+                })?;
+            let model = optional_env("OPENAI_MODEL")?.unwrap_or_else(|| "gpt-4o".to_string());
+            Some(OpenAiDirectConfig { api_key, model })
+        } else {
+            None
+        };
+
+        let anthropic = if backend == LlmBackend::Anthropic {
+            let api_key = optional_env("ANTHROPIC_API_KEY")?
+                .map(SecretString::from)
+                .ok_or_else(|| ConfigError::MissingRequired {
+                    key: "ANTHROPIC_API_KEY".to_string(),
+                    hint: "Set ANTHROPIC_API_KEY when LLM_BACKEND=anthropic".to_string(),
+                })?;
+            let model = optional_env("ANTHROPIC_MODEL")?
+                .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
+            Some(AnthropicDirectConfig { api_key, model })
+        } else {
+            None
+        };
+
+        let ollama = if backend == LlmBackend::Ollama {
+            let base_url = optional_env("OLLAMA_BASE_URL")?
+                .unwrap_or_else(|| "http://localhost:11434".to_string());
+            let model = optional_env("OLLAMA_MODEL")?.unwrap_or_else(|| "llama3".to_string());
+            Some(OllamaConfig { base_url, model })
+        } else {
+            None
+        };
+
+        let openai_compatible = if backend == LlmBackend::OpenAiCompatible {
+            let base_url =
+                optional_env("LLM_BASE_URL")?.ok_or_else(|| ConfigError::MissingRequired {
+                    key: "LLM_BASE_URL".to_string(),
+                    hint: "Set LLM_BASE_URL when LLM_BACKEND=openai_compatible".to_string(),
+                })?;
+            let api_key = optional_env("LLM_API_KEY")?.map(SecretString::from);
+            let model = optional_env("LLM_MODEL")?.unwrap_or_else(|| "default".to_string());
+            Some(OpenAiCompatibleConfig {
+                base_url,
                 api_key,
-            },
+                model,
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            backend,
+            nearai,
+            openai,
+            anthropic,
+            ollama,
+            openai_compatible,
         })
     }
 }
@@ -265,8 +433,6 @@ pub struct EmbeddingsConfig {
     /// OpenAI API key (for OpenAI provider).
     pub openai_api_key: Option<SecretString>,
     /// Model to use for embeddings.
-    /// For OpenAI: "text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002"
-    /// For NEAR AI: Uses the configured session for auth.
     pub model: String,
 }
 
@@ -282,18 +448,15 @@ impl Default for EmbeddingsConfig {
 }
 
 impl EmbeddingsConfig {
-    fn from_env() -> Result<Self, ConfigError> {
-        let settings = crate::settings::Settings::load();
+    fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
         let openai_api_key = optional_env("OPENAI_API_KEY")?.map(SecretString::from);
 
-        // Priority: env var > settings > default
         let provider = optional_env("EMBEDDING_PROVIDER")?
             .unwrap_or_else(|| settings.embeddings.provider.clone());
 
         let model =
             optional_env("EMBEDDING_MODEL")?.unwrap_or_else(|| settings.embeddings.model.clone());
 
-        // Priority: env var > settings > auto-detect from API key
         let enabled = optional_env("EMBEDDING_ENABLED")?
             .map(|s| s.parse())
             .transpose()
@@ -301,10 +464,7 @@ impl EmbeddingsConfig {
                 key: "EMBEDDING_ENABLED".to_string(),
                 message: format!("must be 'true' or 'false': {e}"),
             })?
-            .unwrap_or_else(|| {
-                // Check settings, or auto-enable if API key present
-                settings.embeddings.enabled || openai_api_key.is_some()
-            });
+            .unwrap_or_else(|| settings.embeddings.enabled || openai_api_key.is_some());
 
         Ok(Self {
             enabled,
@@ -338,6 +498,8 @@ pub struct ChannelsConfig {
     pub wasm_channels_dir: std::path::PathBuf,
     /// Whether WASM channels are enabled.
     pub wasm_channels_enabled: bool,
+    /// Telegram owner user ID. When set, the bot only responds to this user.
+    pub telegram_owner_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -364,7 +526,7 @@ pub struct GatewayConfig {
 }
 
 impl ChannelsConfig {
-    fn from_env() -> Result<Self, ConfigError> {
+    fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
         let http = if optional_env("HTTP_PORT")?.is_some() || optional_env("HTTP_HOST")?.is_some() {
             Some(HttpConfig {
                 host: optional_env("HTTP_HOST")?.unwrap_or_else(|| "0.0.0.0".to_string()),
@@ -385,7 +547,7 @@ impl ChannelsConfig {
 
         let gateway = if optional_env("GATEWAY_ENABLED")?
             .map(|s| s.to_lowercase() == "true" || s == "1")
-            .unwrap_or(false)
+            .unwrap_or(true)
         {
             Some(GatewayConfig {
                 host: optional_env("GATEWAY_HOST")?.unwrap_or_else(|| "127.0.0.1".to_string()),
@@ -425,6 +587,14 @@ impl ChannelsConfig {
                     message: format!("must be 'true' or 'false': {e}"),
                 })?
                 .unwrap_or(true),
+            telegram_owner_id: optional_env("TELEGRAM_OWNER_ID")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "TELEGRAM_OWNER_ID".to_string(),
+                    message: format!("must be an integer: {e}"),
+                })?
+                .or(settings.channels.telegram_owner_id),
         })
     }
 }
@@ -450,14 +620,13 @@ pub struct AgentConfig {
     pub use_planning: bool,
     /// Session idle timeout. Sessions inactive longer than this are pruned.
     pub session_idle_timeout: Duration,
+    /// Allow chat to use filesystem/shell tools directly (bypass sandbox).
+    pub allow_local_tools: bool,
 }
 
 impl AgentConfig {
-    fn from_env() -> Result<Self, ConfigError> {
-        let settings = crate::settings::Settings::load();
-
+    fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
         Ok(Self {
-            // Priority: env var > settings > default
             name: optional_env("AGENT_NAME")?.unwrap_or_else(|| settings.agent.name.clone()),
             max_parallel_jobs: optional_env("AGENT_MAX_PARALLEL_JOBS")?
                 .map(|s| s.parse())
@@ -523,6 +692,14 @@ impl AgentConfig {
                     })?
                     .unwrap_or(settings.agent.session_idle_timeout_secs),
             ),
+            allow_local_tools: optional_env("ALLOW_LOCAL_TOOLS")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "ALLOW_LOCAL_TOOLS".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(false),
         })
     }
 }
@@ -535,7 +712,7 @@ pub struct SafetyConfig {
 }
 
 impl SafetyConfig {
-    fn from_env() -> Result<Self, ConfigError> {
+    fn resolve() -> Result<Self, ConfigError> {
         Ok(Self {
             max_output_length: parse_optional_env("SAFETY_MAX_OUTPUT_LENGTH", 100_000)?,
             injection_check_enabled: optional_env("SAFETY_INJECTION_CHECK_ENABLED")?
@@ -573,7 +750,6 @@ pub struct WasmConfig {
 #[derive(Clone, Default)]
 pub struct SecretsConfig {
     /// Master key for encrypting secrets.
-    /// Source determined by KeySource in settings.
     pub master_key: Option<SecretString>,
     /// Whether secrets management is enabled.
     pub enabled: bool,
@@ -592,20 +768,16 @@ impl std::fmt::Debug for SecretsConfig {
 }
 
 impl SecretsConfig {
-    fn from_env() -> Result<Self, ConfigError> {
+    async fn resolve(bootstrap: &crate::bootstrap::BootstrapConfig) -> Result<Self, ConfigError> {
         use crate::settings::KeySource;
 
-        let settings = crate::settings::Settings::load();
-
-        // Priority: env var > keychain (based on settings) > disabled
         let (master_key, source) = if let Some(env_key) = optional_env("SECRETS_MASTER_KEY")? {
-            // Env var takes priority (for CI/Docker)
             (Some(SecretString::from(env_key)), KeySource::Env)
         } else {
-            match settings.secrets_master_key_source {
+            match bootstrap.secrets_master_key_source {
                 KeySource::Keychain => {
-                    // Try to load from OS keychain
-                    match crate::secrets::keychain::get_master_key() {
+                    // Try to load from OS keychain (async on Linux)
+                    match crate::secrets::keychain::get_master_key().await {
                         Ok(key_bytes) => {
                             let key_hex: String =
                                 key_bytes.iter().map(|b| format!("{:02x}", b)).collect();
@@ -623,7 +795,6 @@ impl SecretsConfig {
                     }
                 }
                 KeySource::Env => {
-                    // Settings say env, but no env var found
                     tracing::warn!(
                         "Secrets configured for env var but SECRETS_MASTER_KEY not set."
                     );
@@ -635,7 +806,6 @@ impl SecretsConfig {
 
         let enabled = master_key.is_some();
 
-        // Validate master key length if provided
         if let Some(ref key) = master_key {
             if key.expose_secret().len() < 32 {
                 return Err(ConfigError::InvalidValue {
@@ -681,7 +851,7 @@ fn default_tools_dir() -> PathBuf {
 }
 
 impl WasmConfig {
-    fn from_env() -> Result<Self, ConfigError> {
+    fn resolve() -> Result<Self, ConfigError> {
         Ok(Self {
             enabled: optional_env("WASM_ENABLED")?
                 .map(|s| s.parse())
@@ -752,7 +922,7 @@ pub struct BuilderModeConfig {
 impl Default for BuilderModeConfig {
     fn default() -> Self {
         Self {
-            enabled: true, // Builder enabled by default
+            enabled: true,
             build_dir: None,
             max_iterations: 20,
             timeout_secs: 600,
@@ -762,7 +932,7 @@ impl Default for BuilderModeConfig {
 }
 
 impl BuilderModeConfig {
-    fn from_env() -> Result<Self, ConfigError> {
+    fn resolve() -> Result<Self, ConfigError> {
         Ok(Self {
             enabled: optional_env("BUILDER_ENABLED")?
                 .map(|s| s.parse())
@@ -771,7 +941,7 @@ impl BuilderModeConfig {
                     key: "BUILDER_ENABLED".to_string(),
                     message: format!("must be 'true' or 'false': {e}"),
                 })?
-                .unwrap_or(true), // Builder enabled by default
+                .unwrap_or(true),
             build_dir: optional_env("BUILDER_DIR")?.map(PathBuf::from),
             max_iterations: parse_optional_env("BUILDER_MAX_ITERATIONS", 20)?,
             timeout_secs: parse_optional_env("BUILDER_TIMEOUT_SECS", 600)?,
@@ -826,11 +996,8 @@ impl Default for HeartbeatConfig {
 }
 
 impl HeartbeatConfig {
-    fn from_env() -> Result<Self, ConfigError> {
-        let settings = crate::settings::Settings::load();
-
+    fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
         Ok(Self {
-            // Priority: env var > settings > default
             enabled: optional_env("HEARTBEAT_ENABLED")?
                 .map(|s| s.parse())
                 .transpose()
@@ -848,9 +1015,55 @@ impl HeartbeatConfig {
                 })?
                 .unwrap_or(settings.heartbeat.interval_secs),
             notify_channel: optional_env("HEARTBEAT_NOTIFY_CHANNEL")?
-                .or(settings.heartbeat.notify_channel.clone()),
+                .or_else(|| settings.heartbeat.notify_channel.clone()),
             notify_user: optional_env("HEARTBEAT_NOTIFY_USER")?
-                .or(settings.heartbeat.notify_user.clone()),
+                .or_else(|| settings.heartbeat.notify_user.clone()),
+        })
+    }
+}
+
+/// Routines configuration.
+#[derive(Debug, Clone)]
+pub struct RoutineConfig {
+    /// Whether the routines system is enabled.
+    pub enabled: bool,
+    /// How often (seconds) to poll for cron routines that need firing.
+    pub cron_check_interval_secs: u64,
+    /// Max routines executing concurrently across all users.
+    pub max_concurrent_routines: usize,
+    /// Default cooldown between fires (seconds).
+    pub default_cooldown_secs: u64,
+    /// Max output tokens for lightweight routine LLM calls.
+    pub max_lightweight_tokens: u32,
+}
+
+impl Default for RoutineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cron_check_interval_secs: 15,
+            max_concurrent_routines: 10,
+            default_cooldown_secs: 300,
+            max_lightweight_tokens: 4096,
+        }
+    }
+}
+
+impl RoutineConfig {
+    fn resolve() -> Result<Self, ConfigError> {
+        Ok(Self {
+            enabled: optional_env("ROUTINES_ENABLED")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "ROUTINES_ENABLED".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(true),
+            cron_check_interval_secs: parse_optional_env("ROUTINES_CRON_INTERVAL", 15)?,
+            max_concurrent_routines: parse_optional_env("ROUTINES_MAX_CONCURRENT", 10)?,
+            default_cooldown_secs: parse_optional_env("ROUTINES_DEFAULT_COOLDOWN", 300)?,
+            max_lightweight_tokens: parse_optional_env("ROUTINES_MAX_TOKENS", 4096)?,
         })
     }
 }
@@ -879,7 +1092,7 @@ pub struct SandboxModeConfig {
 impl Default for SandboxModeConfig {
     fn default() -> Self {
         Self {
-            enabled: true, // Enabled by default
+            enabled: true,
             policy: "readonly".to_string(),
             timeout_secs: 120,
             memory_limit_mb: 2048,
@@ -892,7 +1105,7 @@ impl Default for SandboxModeConfig {
 }
 
 impl SandboxModeConfig {
-    fn from_env() -> Result<Self, ConfigError> {
+    fn resolve() -> Result<Self, ConfigError> {
         let extra_domains = optional_env("SANDBOX_EXTRA_DOMAINS")?
             .map(|s| s.split(',').map(|d| d.trim().to_string()).collect())
             .unwrap_or_default();
@@ -945,6 +1158,111 @@ impl SandboxModeConfig {
             auto_pull_image: self.auto_pull_image,
             proxy_port: 0, // Auto-assign
         }
+    }
+}
+
+/// Claude Code sandbox configuration.
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeConfig {
+    /// Whether Claude Code sandbox mode is available.
+    pub enabled: bool,
+    /// Host directory containing Claude auth session (mounted read-only).
+    pub config_dir: std::path::PathBuf,
+    /// Claude model to use (e.g. "sonnet", "opus").
+    pub model: String,
+    /// Maximum agentic turns before stopping.
+    pub max_turns: u32,
+    /// Memory limit in MB for Claude Code containers (heavier than workers).
+    pub memory_limit_mb: u64,
+    /// Allowed tool patterns for Claude Code permission settings.
+    ///
+    /// Written to `/workspace/.claude/settings.json` before spawning the CLI.
+    /// Provides defense-in-depth: only explicitly listed tools are auto-approved.
+    /// Any new/unknown tools would require interactive approval (which times out
+    /// in the non-interactive container, failing safely).
+    ///
+    /// Patterns follow Claude Code syntax: `"Bash(*)"`, `"Read"`, `"Edit(*)"`, etc.
+    pub allowed_tools: Vec<String>,
+}
+
+/// Default allowed tools for Claude Code inside containers.
+///
+/// These cover all standard Claude Code tools needed for autonomous operation.
+/// The Docker container provides the primary security boundary; this allowlist
+/// provides defense-in-depth by preventing any future unknown tools from being
+/// silently auto-approved.
+fn default_claude_code_allowed_tools() -> Vec<String> {
+    [
+        "Bash(*)",
+        "Read",
+        "Edit(*)",
+        "Glob",
+        "Grep",
+        "WebFetch(*)",
+        "Task(*)",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+impl Default for ClaudeCodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            config_dir: dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".claude"),
+            model: "sonnet".to_string(),
+            max_turns: 50,
+            memory_limit_mb: 4096,
+            allowed_tools: default_claude_code_allowed_tools(),
+        }
+    }
+}
+
+impl ClaudeCodeConfig {
+    /// Load from environment variables only (used inside containers where
+    /// there is no database or full config).
+    pub fn from_env() -> Self {
+        match Self::resolve() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to resolve ClaudeCodeConfig: {e}, using defaults");
+                Self::default()
+            }
+        }
+    }
+
+    fn resolve() -> Result<Self, ConfigError> {
+        let defaults = Self::default();
+        Ok(Self {
+            enabled: optional_env("CLAUDE_CODE_ENABLED")?
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(|e| ConfigError::InvalidValue {
+                    key: "CLAUDE_CODE_ENABLED".to_string(),
+                    message: format!("must be 'true' or 'false': {e}"),
+                })?
+                .unwrap_or(defaults.enabled),
+            config_dir: optional_env("CLAUDE_CONFIG_DIR")?
+                .map(std::path::PathBuf::from)
+                .unwrap_or(defaults.config_dir),
+            model: optional_env("CLAUDE_CODE_MODEL")?.unwrap_or(defaults.model),
+            max_turns: parse_optional_env("CLAUDE_CODE_MAX_TURNS", defaults.max_turns)?,
+            memory_limit_mb: parse_optional_env(
+                "CLAUDE_CODE_MEMORY_LIMIT_MB",
+                defaults.memory_limit_mb,
+            )?,
+            allowed_tools: optional_env("CLAUDE_CODE_ALLOWED_TOOLS")?
+                .map(|s| {
+                    s.split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect()
+                })
+                .unwrap_or(defaults.allowed_tools),
+        })
     }
 }
 

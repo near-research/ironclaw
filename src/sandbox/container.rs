@@ -279,11 +279,7 @@ impl ContainerRunner {
             network_mode: Some("bridge".to_string()),
             // Security: drop all capabilities and add back only what's needed
             cap_drop: Some(vec!["ALL".to_string()]),
-            cap_add: Some(vec![
-                "CHOWN".to_string(),
-                "SETUID".to_string(),
-                "SETGID".to_string(),
-            ]),
+            cap_add: Some(vec!["CHOWN".to_string()]),
             // Prevent privilege escalation
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             // Read-only root filesystem (workspace is still writable if policy allows)
@@ -491,9 +487,36 @@ impl ContainerRunner {
 }
 
 /// Connect to the Docker daemon.
+///
+/// Tries these locations in order:
+/// 1. `DOCKER_HOST` env var (bollard default)
+/// 2. `/var/run/docker.sock` (Linux default)
+/// 3. `~/.docker/run/docker.sock` (Docker Desktop on macOS)
 pub async fn connect_docker() -> Result<Docker> {
-    Docker::connect_with_local_defaults().map_err(|e| SandboxError::DockerNotAvailable {
-        reason: e.to_string(),
+    // First try bollard defaults (checks DOCKER_HOST, then /var/run/docker.sock)
+    if let Ok(docker) = Docker::connect_with_local_defaults() {
+        if docker.ping().await.is_ok() {
+            return Ok(docker);
+        }
+    }
+
+    // Try Docker Desktop socket (macOS)
+    if let Some(home) = std::env::var_os("HOME") {
+        let desktop_sock = std::path::Path::new(&home).join(".docker/run/docker.sock");
+        if desktop_sock.exists() {
+            let sock_str = desktop_sock.to_string_lossy();
+            if let Ok(docker) =
+                Docker::connect_with_socket(&sock_str, 120, bollard::API_DEFAULT_VERSION)
+            {
+                if docker.ping().await.is_ok() {
+                    return Ok(docker);
+                }
+            }
+        }
+    }
+
+    Err(SandboxError::DockerNotAvailable {
+        reason: "Socket not found: /var/run/docker.sock".to_string(),
     })
 }
 
